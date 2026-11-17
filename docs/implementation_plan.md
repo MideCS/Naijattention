@@ -4,11 +4,47 @@
 **Deliverable:** One reproducible Jupyter notebook that loads and audits three parallel corpora (MAFAND-MT, Naija Treebank, and the specified MTurk CSV), fine-tunes two comparable mT5-small models, evaluates translations and sentence alignment, and demonstrates English-to-Pidgin inference.  
 **Core research question:** Holding the training data, architecture, budget, and decoding settings fixed, does adding a cross-lingual sentence-level contrastive objective to translation cross-entropy improve translation quality and/or encoder embedding alignment?
 
-## Implementation status (2026-11-13)
+## Implementation status (2026-11-16)
 
-Implemented in `src/naijattention/` (package), `notebooks/naijattention.ipynb` (Colab-ready) and
-`scripts/run_experiment.py` (CLI). Smoke-tested end to end on an RTX 3060 6 GB. Every data count in §3A was
-reproduced exactly at the pinned commits (35,450 raw train -> 310 leakage removals -> 35,058; dev/test overlap 17/20/14).
+Code: https://github.com/MideCS/Naijattention. It lives in `src/naijattention/` (package), `notebooks/naijattention.ipynb`
+(Colab-ready) and `scripts/run_experiment.py` (CLI, `--smoke` / `--pilot` / full, `--set key=value` overrides).
+Every data count in §3A was reproduced exactly at the pinned commits (35,450 raw train -> 310 leakage removals ->
+79+2+1 duplicate removals -> 35,058 train: MAFAND 4,787, MTurk 23,381, Naija 6,890; validation 2,474; test 2,536;
+published dev/test overlap 17/20/14).
+
+**Verification done so far**
+
+| Stage | Where | Outcome |
+|---|---|---|
+| Unit tests (`tests/test_core.py`, 8 tests) | local | pass |
+| Static checks (pooling, InfoNCE, retrieval gate, loss sanity, batch check) | runs before every training | pass |
+| Tokenizer/collation of all 40,068 rows | local | pass; saved tokenizer encodes identically to the original |
+| Smoke run (64 rows, 6 updates) | local CLI + notebook | pass, all integrity checks true |
+| Pilot, batch 8, greedy decoding | local RTX 3060 6 GB | pass; 8/8 integrity checks; 0 empty outputs |
+| Pilot, batch 32, beam 4 (the real settings) | Colab A100 | pass; val chrF++ 51.93 baseline vs 52.02 contrastive; InfoNCE falls from ln(32) ~ 3.47 to ~0.3 |
+
+Pilot numbers (1 epoch, 300 updates, one seed) only show the pipeline works and the learning rate is sane;
+they are **not** research results. The 0.09 chrF++ validation gap is well within seed noise.
+
+**Running it**
+
+- Colab: open `notebooks/naijattention.ipynb` from GitHub, set `RUN_MODE` (`"smoke"`, `"pilot"` default, `"full"`),
+  run all. Outputs go to Google Drive (`MyDrive/naijattention/outputs/<mode>`), checkpoints ~1 GB per model.
+- Run-level resume: a run whose `train_history.json` exists with identical settings is reused, not retrained;
+  an interrupted run restarts from scratch; a finished run with *different* settings raises an error unless
+  `overwrite=True`. Mid-epoch resume is not implemented, so a Colab disconnect costs at most the run in progress.
+- Full run: ~1,095 updates/epoch x 10 epochs per model (~36x the pilot's 300 updates) plus 10 validation passes
+  per model. Estimate wall-clock as pilot training minutes x 36 + validation time.
+- Before claiming an effect, repeat both models with 2-3 seeds (`--set seed=...`, separate `output_dir`).
+- GPU memory (mT5-small, bf16, max length 128): batch 8 ~5.2 GB, batch 16 ~8.4 GB, batch 32 ~15 GB. A T4 has
+  no fast bf16, so it runs FP32 and needs `gradient_checkpointing=True` or batch 16 x accumulation 2 (fewer negatives).
+
+**Engineering additions not in the original plan:** progress logging with ETA every `log_every` updates and
+validation timing; explicit GPU memory release between runs (a Windows access-violation crash when loading the
+second model was traced to memory retained by the pre-training loss check and fixed); strict retrieval rank
+consistent with argmax (ties broken toward the lower index) alongside relaxed R@1 and the reverse direction;
+paired bootstrap for chrF++ and retrieval deltas; blinded A/B human-evaluation sheet with a separate key file;
+a training-health table (initial/final losses, best epoch, peak memory) and 8 end-of-run integrity checks.
 
 **Deviations from the original plan, and why:**
 
@@ -284,7 +320,7 @@ Map `dev -> validation`; preserve `source_split` unchanged. Avoid using position
 5. **Block train-to-evaluation leakage.** Build combined held-out sets of `eng_norm` and `pcm_norm` across **both validation and test**, and remove *any training row whose normalized English OR normalized Pidgin string appears in either*. Also remove exact normalized pair duplicates within training, retaining the highest-priority source row (`naija` human-spoken > `mafand` curated > `mturk` when conflicts are truly identical); always preserve a duplicate-removal audit. Optional near-duplicate MinHash/fuzzy filtering is a separate documented pass, not a silent change.
 6. **Important observed overlap results.** On the tested raw versions: 35,450 initial training rows; 5,010 combined validation/test rows. Exactly **310 training rows** matched at least one English or Pidgin normalized key in the held-out pool. After excluding these and deduplicating remaining *pair keys*, **35,058 training rows** remained. These are measured outputs of the simple normalization logic, not guaranteed counts after other quality filters or version changes.
 7. **Do not silently reassign held-out examples.** Our probe also found overlaps between the *published* dev and test sets themselves: 17 dev rows matched a test English key, 20 matched a test Pidgin key, and 14 matched an identical pair. Keep original source benchmarks intact for comparability; document these cases. For a strictly disjoint **secondary** aggregate analysis, remove conflicting validation rows according to a rule established before model evaluation, or report per-source metrics separately. Never train on either held-out partition.
-8. **Sampling to target size.** For the primary 25K experiment, deterministically sample **25,000 rows from the ~35K cleaned training pool only**, stratified by `source`, preferably retaining all available `naija` and `mafand` training rows and drawing the remainder from `mturk`. Use seed 42, persist selected `source_id`s, and report per-source counts. If using all 35K, document a different experiment configuration. For nested low-resource comparisons, sample training `5K ⊂ 10K ⊂ 25K`, ideally maintaining comparable source/domain proportions instead of drawing the smallest set from just one source.
+8. **Training-set size.** The primary experiment uses **all 35,058 cleaned training rows** (`train_subset_size=None`). The optional 25K experiment (`train_subset_size=25000`) deterministically samples from the cleaned training pool only, keeping all `naija` and `mafand` rows and drawing the remainder from `mturk` (seed 42; result: MAFAND 4,787 / MTurk 13,323 / Naija 6,890). Validation and test are never subsampled. The nested 5K/10K splits were dropped.
 9. **Check recording leakage within Naija.** `speaker_id` can recur across splits; evaluate whether `recording_id` or speaker content crosses. Do not automatically move established Naija test rows, but report source/speaker split overlap, and provide an optional stricter speaker-disjoint evaluation if the original test permits it.
 10. **Convert and save.** Save harmonized source-specific data as `data/processed/{source}_{split}.parquet` and the selected merged `train_25k.parquet`, `validation.parquet`, `test.parquet`, plus two per-source holdout variants. Save a metadata JSON with raw/source counts, exclusions, duplicate counts, hashes, seed and code revision. `datasets.Dataset.from_pandas(df, preserve_index=False)` or `DatasetDict` can be used downstream; the custom collator must consume the renamed `english` and `pidgin` columns rather than old `eng`/`pcm` names.
 11. **Assert invariants.** Training length equals the chosen size; train English keys are disjoint from held-out English keys; train Pidgin keys disjoint from held-out Pidgin keys; no duplicate normalized pair keys remain in training; all required strings are nonempty; all provenance IDs unique within source; all labels are legitimate Pidgin strings. Check no evaluation pair was placed into training, and print the precise source composition of each split.
